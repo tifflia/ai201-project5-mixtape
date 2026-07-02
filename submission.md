@@ -111,3 +111,19 @@ I opened `services/streak_service.py` and read `update_listening_streak`, then c
 I removed the `and today.weekday() != 6` clause so the branch reads `elif days_since_last == 1:` — a listen exactly one day after the last one now increments the streak on every day of the week, matching the documented rules. 
 
 To confirm I didn't break anything, I ran the full streak suite (`tests/test_streaks.py`): all 5 tests pass, including the previously-failing `test_streak_increments_on_sunday`, and the other cases that guard the surrounding behavior still hold — new user starts at 1 (`test_streak_starts_at_1_for_new_user`), consecutive weekday listens increment (`test_streak_increments_on_consecutive_day`), same-day repeat listens don't double-count (`test_streak_does_not_double_count_same_day`), and a skipped day still resets to 1 (`test_streak_resets_after_skipped_day`). The `days_since_last == 0` and `else`/reset branches were untouched, so removing the Sunday guard only affects the one-day-gap case it was wrongly interfering with.
+
+## Bug 2 — *"Friends Listening Now shows people from yesterday"*
+
+### How I reproduced it
+I reseeded the database (`python seed_data.py`) and inspected the seed data setup in `seed_data.py`: it plants two distinct buckets of listening events — "recent" events from within the past 30 minutes (`now - timedelta(minutes=10 + i*5)`) that *should* appear in "listening now," and "older" events from 1–14 days ago that should *not*. Calling `get_friends_listening_now` for a user with friends returned entries whose `listened_at` fell on the previous day, matching the report: people who listened yesterday were surfacing in a feed that's supposed to show who's listening *now*.
+
+### How I found the root cause
+I opened `services/feed_service.py` and read `get_friends_listening_now` top to bottom. The query itself is correct — it resolves friend IDs from `user.friends`, filters `ListeningEvent.listened_at >= cutoff`, orders by most-recent, and deduplicates to one song per friend. The comparison direction and the dedup logic are sound, so the bug wasn't mechanical. That pushed me to the one value the whole filter hinges on: `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`, where `RECENT_THRESHOLD = timedelta(hours=24)` at line 13. Cross-referencing that against `seed_data.py`'s own comments — "within the past 30 minutes → should appear," "1–14 days ago → should NOT appear after fix" — made it clear the threshold's *magnitude*, not the code around it, was the specific cause.
+
+### The root cause
+`RECENT_THRESHOLD` was set to 24 hours. The filter `listened_at >= now - 24h` therefore admits any listen from the entire previous day, not just listens happening right now. The code does exactly what it says — the defect is that the window's semantics don't match the feature: "Friends Listening Now" implies people actively listening in the moment, but a 24-hour window treats "yesterday" as "now." So a friend who played a song 23 hours ago still qualified, producing the "shows people from yesterday" symptom.
+
+### Fix and side-effect check
+I changed `RECENT_THRESHOLD` from `timedelta(hours=24)` to `timedelta(minutes=30)`. This tightens the window to a genuine "now" horizon: it comfortably clears the seed data's recent bucket (listens 10–20 minutes ago still appear) while excluding the 1–14-day-old bucket entirely, so yesterday's listeners drop off.
+
+To confirm I didn't break anything, I reran the full suite (`python -m pytest`): the streak and search suites still pass, and `get_activity_feed` — the other function in this module — was untouched and is intentionally *not* time-filtered, so shrinking `RECENT_THRESHOLD` has no effect on it. I also re-verified against the reseeded data that the recent events still surface while the older ones no longer do.
