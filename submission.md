@@ -145,3 +145,30 @@ I opened `services/search_service.py` and read `search_songs`. The `WHERE` claus
 I removed the `outerjoin(song_tags, ...)` entirely (and the now-unused `Tag`/`song_tags` imports). The query now filters directly on `Song.title`/`Song.artist` and returns each matching `Song` exactly once — no fan-out to dedupe in the first place, which is the root-cause fix rather than papering over it with `.distinct()`. The tags list in each dict is unaffected: `to_dict()` still reads `Song.tags` via the `lazy="subquery"` relationship, so every song dict continues to carry its `tags` name-string list. This matches the function's documented contract exactly — "all songs where the title or artist contains the query string … along with their associated tags."
 
 To confirm I didn't break anything I ran `tests/test_search.py`: all 5 tests pass (matching songs returned, no duplicates for 0/1/3-tag songs, empty result for no match). I also verified against reseeded data: "Crown Heights Anthem" returns once with all three tags `['rap', 'hip-hop', 'boom bap']`; the tagless "Midnight Drive" still appears (removing the *outer* join didn't drop zero-tag songs — a specific risk I checked, since an inner join would have); and a broad query (`'a'`) returns 13 songs with no duplicates. Because the change only removes a redundant join and touches no other function, there are no cross-feature side effects.
+
+## Bug 4 — *"I got notified when a friend added my song to a playlist but not when they rated it"*
+
+### How I reproduced it
+I reseeded the database and drove the two notification-producing actions side by side against the same song ("Midnight Drive", shared by *nova*). Having a friend (*darius*) add the song to a playlist via `add_to_playlist` created a notification for nova, as expected. But having darius rate the same song via `rate_song(darius.id, song.id, 4)` produced **no** notification for nova — her notification count stayed flat. That's exactly the reported asymmetry: the playlist action notifies the sharer, the rating action doesn't.
+
+### How I found the root cause
+Both actions live in `services/notification_service.py`, so I read the two functions back to back. `add_to_playlist` ends with a clear notification block — after committing, it calls `create_notification(user_id=song.shared_by, notification_type="song_added_to_playlist", ...)`, guarded by `if song.shared_by != added_by_user_id` so you're never notified about your own action. `rate_song` has the mirror-image *setup* — it already loads both the `Song` and the rating `User` (`rater`), which are precisely the objects you'd need to build a notification — but after `db.session.commit()` it simply `return rating`. The notification step that its sibling has is just missing. The fact that `rate_song` fetches `rater` and `song` but never uses them to notify anyone was the moment it was clearly the specific cause, not a vague "notifications area."
+
+### The root cause
+`rate_song` upserts the `Rating` and commits, but never calls `create_notification`. The module's whole design principle (documented in the codebase map: "all notification-producing actions on a shared song live together, organized by trigger") means rating a song is supposed to notify the song's original sharer — the same as adding it to a playlist. That notification call was never wired into `rate_song`, so the rating path persisted the score correctly but silently skipped the side effect, leaving sharers uninformed when their songs were rated.
+
+### Fix and side-effect check
+I added a notification block to `rate_song`, placed after the commit and modeled exactly on `add_to_playlist`:
+
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by,
+        notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score}/5.",
+    )
+```
+
+Key choices: the recipient is `song.shared_by` (the original sharer, consistent with the playlist path); the `song.shared_by != user_id` guard prevents self-notification when a user rates their own song; the type is `"song_rated"` (one of the example types named in `create_notification`'s docstring); and the call sits *after* `db.session.commit()` so a rating that failed to persist never fires a notification. Because `rate_song` already loaded `song` and `rater`, no extra queries were needed.
+
+To confirm the fix and check for side effects I verified end-to-end against reseeded data: a friend rating nova's song now creates a `song_rated` notification with the body "darius rated your song 'Midnight Drive' 4/5.", while nova rating her *own* song produces no notification (count unchanged) — the self-guard holds. The rating upsert itself is untouched, so re-rating still updates the score in place; it now also (correctly) notifies on each rating, matching the playlist path's "notify on the action" behavior. I ran the full suite (`python -m pytest`): the streak and search suites still pass and nothing regressed.
